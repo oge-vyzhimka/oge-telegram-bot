@@ -139,6 +139,39 @@ async function triggerRedeploy(repo: string) {
   return res;
 }
 
+async function rollbackCommit(repo: string, branch = "main") {
+  try {
+    const res = await fetch(`https://api.github.com/repos/${repo}/commits?per_page=2`, {
+      headers: { "Authorization": `token ${GITHUB_TOKEN}`, "User-Agent": "VyjimkaBot" }
+    });
+    const commits = await res.json();
+    if (!Array.isArray(commits) || commits.length < 2) return null;
+    const previousCommit = commits[1];
+
+    const patchRes = await fetch(`https://api.github.com/repos/${repo}/git/refs/heads/${branch}`, {
+      method: "PATCH",
+      headers: {
+        "Authorization": `token ${GITHUB_TOKEN}`,
+        "Content-Type": "application/json",
+        "User-Agent": "VyjimkaBot"
+      },
+      body: JSON.stringify({ sha: previousCommit.sha, force: true })
+    });
+
+    if (patchRes.ok) {
+      return {
+        revertedSha: commits[0].sha.substring(0, 7),
+        revertedMsg: commits[0].commit.message,
+        restoredSha: previousCommit.sha.substring(0, 7),
+        restoredMsg: previousCommit.commit.message
+      };
+    }
+  } catch (err) {
+    console.error("Rollback error:", err);
+  }
+  return null;
+}
+
 async function checkSiteHealth() {
   try {
     const t0 = Date.now();
@@ -162,16 +195,25 @@ async function askAI(prompt: string, context: string, apiKey: string): Promise<{
   try {
     // 1. OpenRouter (sk-or-...)
     if (apiKey.startsWith("sk-or-")) {
-      const candidateModels = [
-        "google/gemini-2.0-flash-exp:free",
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "deepseek/deepseek-r1:free",
-        "mistralai/mistral-7b-instruct:free",
-        "qwen/qwen-2.5-coder-32b-instruct:free"
-      ];
+      let candidateModels: string[] = [];
+      try {
+        const modelsRes = await fetch("https://openrouter.ai/api/v1/models");
+        const modelsData = await modelsRes.json();
+        if (Array.isArray(modelsData.data)) {
+          candidateModels = modelsData.data
+            .filter((m: { id?: string; pricing?: { prompt?: string; completion?: string } }) => 
+              m.id?.endsWith(":free") || (m.pricing?.prompt === "0" && m.pricing?.completion === "0")
+            )
+            .map((m: { id: string }) => m.id);
+        }
+      } catch (_) {}
+
+      if (candidateModels.length === 0) {
+        candidateModels = ["qwen/qwen3.8-27b:free", "stealth/space-bunny-alpha", "nvidia/nemotron-3.5-lightning:free"];
+      }
 
       let lastError = "";
-      for (const model of candidateModels) {
+      for (const model of candidateModels.slice(0, 8)) {
         try {
           const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
             method: "POST",
@@ -301,6 +343,37 @@ Deno.serve(async (req: Request) => {
       const tgData = await tgRes.json();
       return new Response(JSON.stringify({ webhookUrl, telegram: tgData }, null, 2), {
         headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url.pathname.endsWith("/checkModels")) {
+      const apiKey = Deno.env.get("GEMINI_API_KEY") || "";
+      const modelsRes = await fetch("https://openrouter.ai/api/v1/models");
+      const modelsData = await modelsRes.json();
+      const free = Array.isArray(modelsData.data)
+        ? modelsData.data
+            .filter((m: { id?: string; pricing?: { prompt?: string; completion?: string } }) => 
+              m.id?.endsWith(":free") || (m.pricing?.prompt === "0" && m.pricing?.completion === "0")
+            )
+            .map((m: { id: string }) => m.id)
+        : [];
+
+      let testResult = null;
+      if (apiKey && free.length > 0) {
+        const testRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: free[0],
+            messages: [{ role: "user", content: "hi" }]
+          })
+        });
+        testResult = { model: free[0], status: testRes.status, data: await testRes.json() };
+      }
+      return new Response(JSON.stringify({ freeCount: free.length, freeList: free.slice(0, 15), testResult }, null, 2), {
+        headers: { "Content-Type": "application/json" }
       });
     }
 

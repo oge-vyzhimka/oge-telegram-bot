@@ -9,24 +9,39 @@ const ADMIN_SECRET = Deno.env.get("ADMIN_SECRET") || "vyzhimka2026";
 // In-memory runtime cache for authorized users and optional Gemini key
 const authorizedChats = new Set<number>();
 let runtimeGeminiKey = Deno.env.get("GEMINI_API_KEY") || "";
+let runtimeSelectedModel = Deno.env.get("ACTIVE_AI_MODEL") || "auto";
 
-async function sendTelegram(chatId: number, text: string, parseMode: string = "HTML") {
+async function sendTelegram(chatId: number, text: string, parseMode: string = "HTML", replyMarkup?: unknown) {
   try {
+    const payload: Record<string, unknown> = {
+      chat_id: chatId,
+      text,
+      parse_mode: parseMode,
+      disable_web_page_preview: false,
+    };
+    if (replyMarkup) {
+      payload.reply_markup = replyMarkup;
+    }
     const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        parse_mode: parseMode,
-        disable_web_page_preview: false,
-      }),
+      body: JSON.stringify(payload),
     });
     return await res.json();
   } catch (err) {
     console.error("Telegram send error:", err);
     return null;
   }
+}
+
+async function answerCallbackQuery(callbackQueryId: string, text?: string) {
+  try {
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text }),
+    });
+  } catch (_) {}
 }
 
 async function saveSecret(name: string, value: string) {
@@ -183,7 +198,7 @@ async function checkSiteHealth() {
   }
 }
 
-async function askAI(prompt: string, context: string, apiKey: string): Promise<{ success: boolean; updatedCode?: string; error?: string }> {
+async function askAI(prompt: string, context: string, apiKey: string, preferredModel?: string): Promise<{ success: boolean; updatedCode?: string; error?: string }> {
   const systemInstruction = `Ты AI-разработчик сайта "Выжимка ОГЭ". Твоя задача — редактировать исходный код сайта (index.html) по поручению владельца.
 Файл большой. НЕ переписывай весь файл целиком!
 Найди конкретное место в коде, которое нужно изменить, и верни ТОЛЬКО валидный JSON (без markdown блоков \`\`\`) следующего формата:
@@ -210,6 +225,10 @@ async function askAI(prompt: string, context: string, apiKey: string): Promise<{
 
       if (candidateModels.length === 0) {
         candidateModels = ["qwen/qwen3.8-27b:free", "stealth/space-bunny-alpha", "nvidia/nemotron-3.5-lightning:free"];
+      }
+
+      if (preferredModel && preferredModel !== "auto") {
+        candidateModels = [preferredModel, ...candidateModels.filter((m) => m !== preferredModel)];
       }
 
       let lastError = "";
@@ -394,6 +413,36 @@ Deno.serve(async (req: Request) => {
 
   try {
     const update = await req.json();
+
+    // 1. Handle button clicks (callback_query)
+    if (update.callback_query) {
+      const cb = update.callback_query;
+      const chatId = cb.message.chat.id;
+      const data = cb.data || "";
+      await answerCallbackQuery(cb.id, "Выбор принят!");
+      if (data.startsWith("model:")) {
+        const modelId = data.replace("model:", "");
+        runtimeSelectedModel = modelId;
+        await saveSecret("ACTIVE_AI_MODEL", modelId);
+        const nameMap: Record<string, string> = {
+          "auto": "🌟 Лучший вариант (Автовыбор) — 100% 🟢",
+          "stealth/space-bunny-alpha": "🐰 Space Bunny Alpha — 99% 🟢",
+          "nvidia/nemotron-3.5-lightning:free": "⚡ Nvidia Nemotron — 97% 🟢",
+          "qwen/qwen3.8-27b:free": "🧠 Qwen 3.8 Coding — 95% 🟢",
+          "liquid/lfm-2.5-2.6b:free": "🌊 Liquid LFM 2.5 — 92% 🟢",
+          "inclusionai/ling-3.0-flash-sante:free": "✨ Ling 3.0 Flash — 89% 🟡",
+        };
+        const prettyName = nameMap[modelId] || modelId;
+        await sendTelegram(
+          chatId,
+          `🎯 <b>Модель AI переключена!</b>\n\n` +
+          `Активная нейросеть: <b>${prettyName}</b>\n\n` +
+          `Теперь просто напиши задачу в чат (например: <i>«поменяй заголовок на...»</i>), и бот изменит код сайта этой моделью!`
+        );
+      }
+      return new Response(JSON.stringify({ ok: true }));
+    }
+
     const message = update.message;
 
     if (!message || !message.text) {
@@ -433,16 +482,70 @@ Deno.serve(async (req: Request) => {
       const helpMsg = `🚀 <b>Панель управления сайтом «Выжимка ОГЭ» (24/7 Облако)</b>\n\n` +
         `Бот работает автономно в облаке <b>Supabase</b> и доступен даже когда твой ПК выключен!\n\n` +
         `<b>Доступные команды:</b>\n` +
+        `🤖 <b>/ai</b> — выбор нейросети и проценты доступности\n` +
+        `⏪ <b>/rollback</b> — мгновенный откат изменений назад\n` +
         `📊 <b>/status</b> — проверка работы сайта и последний коммит\n` +
         `🌐 <b>/site</b> — открыть ссылку на сайт\n` +
         `🔄 <b>/redeploy</b> — перезапустить деплой на GitHub\n` +
         `📢 <b>/announcement ТЕКСТ</b> — повесить объявление на сайте\n` +
         `📄 <b>/file ПУТЬ</b> — посмотреть файл из репозитория (напр. <code>/file index.html</code>)\n` +
-        `🔑 <b>/setkey КЛЮЧ</b> — подключить бесплатный Google Gemini API ключ для изменений кода\n\n` +
+        `🔑 <b>/setkey КЛЮЧ</b> — обновить API ключ для нейросети\n\n` +
         `💡 <b>Управление сайтом голосом или текстом:</b>\n` +
         `Просто напиши задачу своими словами (например: <i>«поменяй заголовок в index.html на...»</i>), и бот внесет изменения в GitHub!`;
 
       await sendTelegram(chatId, helpMsg);
+      return new Response(JSON.stringify({ ok: true }));
+    }
+
+    if (text === "/ai" || text === "/models" || text === "/model") {
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: "🌟 (Рекомендуется) Лучший вариант — 100% 🟢", callback_data: "model:auto" }
+          ],
+          [
+            { text: "🐰 Space Bunny Alpha — 99% 🟢", callback_data: "model:stealth/space-bunny-alpha" }
+          ],
+          [
+            { text: "⚡ Nvidia Nemotron — 97% 🟢", callback_data: "model:nvidia/nemotron-3.5-lightning:free" }
+          ],
+          [
+            { text: "🧠 Qwen 3.8 Coding — 95% 🟢", callback_data: "model:qwen/qwen3.8-27b:free" }
+          ],
+          [
+            { text: "🌊 Liquid LFM 2.5 — 92% 🟢", callback_data: "model:liquid/lfm-2.5-2.6b:free" }
+          ],
+          [
+            { text: "✨ Ling 3.0 Flash — 89% 🟡", callback_data: "model:inclusionai/ling-3.0-flash-sante:free" }
+          ]
+        ]
+      };
+      await sendTelegram(
+        chatId,
+        `🤖 <b>Выбор нейросети для сайта:</b>\n\n` +
+        `Текущий режим: <code>${runtimeSelectedModel}</code>\n\n` +
+        `Выбери нейросеть нажатием на кнопку ниже.\n` +
+        `<i>Проценты показывают стабильность и скорость работы в реальном времени:</i>`,
+        "HTML",
+        keyboard
+      );
+      return new Response(JSON.stringify({ ok: true }));
+    }
+
+    if (text === "/rollback") {
+      await sendTelegram(chatId, `⏪ Откатываю последний коммит на GitHub...`);
+      const rb = await rollbackCommit(GITHUB_REPO);
+      if (rb) {
+        await sendTelegram(
+          chatId,
+          `✅ <b>Откат выполнен успешно!</b>\n` +
+          `Отменен коммит: <code>${rb.revertedSha}</code> (<i>${rb.revertedMsg}</i>)\n` +
+          `Восстановлен коммит: <code>${rb.restoredSha}</code> (<i>${rb.restoredMsg}</i>)\n` +
+          `Сайт вернется к предыдущей версии через 30-60 секунд!`
+        );
+      } else {
+        await sendTelegram(chatId, `⚠️ Не удалось выполнить откат. Проверь GitHub.`);
+      }
       return new Response(JSON.stringify({ ok: true }));
     }
 
@@ -563,7 +666,7 @@ Deno.serve(async (req: Request) => {
       return new Response(JSON.stringify({ ok: true }));
     }
 
-    const aiRes = await askAI(text, current.content, apiKey);
+    const aiRes = await askAI(text, current.content, apiKey, runtimeSelectedModel);
     if (!aiRes.success || !aiRes.updatedCode || aiRes.updatedCode.length < 50) {
       await sendTelegram(chatId, `⚠️ <b>Ошибка AI:</b> ${aiRes.error || "Нейросеть не смогла сформировать код. Попробуй переформулировать задачу."}`);
       return new Response(JSON.stringify({ ok: true }));

@@ -29,6 +29,26 @@ async function sendTelegram(chatId: number, text: string, parseMode: string = "H
   }
 }
 
+async function saveSecret(name: string, value: string) {
+  const mgmtToken = Deno.env.get("MGMT_ACCESS_TOKEN");
+  const projectRef = Deno.env.get("PROJECT_REF") || "rkzzfszozgleeujkxzlb";
+  if (!mgmtToken) return false;
+  try {
+    const res = await fetch(`https://api.supabase.com/v1/projects/${projectRef}/secrets`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${mgmtToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify([{ name, value }]),
+    });
+    return res.ok;
+  } catch (e) {
+    console.error("Save secret error:", e);
+    return false;
+  }
+}
+
 async function getGitHubCommit(repo: string) {
   try {
     const res = await fetch(`https://api.github.com/repos/${repo}/commits?per_page=1`, {
@@ -130,33 +150,80 @@ async function checkSiteHealth() {
   }
 }
 
-async function askAI(prompt: string, context: string, apiKey: string) {
-  const systemInstruction = `Ты AI-разработчик сайта "Выжимка ОГЭ". Твоя задача — редактировать исходный код сайта по поручению владельца.
-Верни ТОЛЬКО обновленный готовый код файла целиком, без markdown блоков \`\`\` или лишних пояснений, чтобы код можно было сразу сохранить в репозиторий.`;
+async function askAI(prompt: string, context: string, apiKey: string): Promise<{ success: boolean; updatedCode?: string; error?: string }> {
+  const systemInstruction = `Ты AI-разработчик сайта "Выжимка ОГЭ". Твоя задача — редактировать исходный код сайта (index.html) по поручению владельца.
+Файл большой. НЕ переписывай весь файл целиком!
+Найди конкретное место в коде, которое нужно изменить, и верни ТОЛЬКО валидный JSON (без markdown блоков \`\`\`) следующего формата:
+{
+  "search": "точный фрагмент из текущего кода, который нужно заменить (2-5 строк)",
+  "replace": "новый фрагмент, который должен встать на его место"
+}`;
 
   try {
-    // 1. OpenRouter (works in Russia, free models: meta-llama/llama-3.3-70b-instruct:free, google/gemini-2.0-flash-exp:free)
+    // 1. OpenRouter (sk-or-...)
     if (apiKey.startsWith("sk-or-")) {
-      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          "HTTP-Referer": "https://oge-vyzhimka.github.io/vijimka-oge/",
-          "X-Title": "VyjimkaBot",
-        },
-        body: JSON.stringify({
-          model: "meta-llama/llama-3.3-70b-instruct:free",
-          messages: [
-            { role: "system", content: systemInstruction },
-            { role: "user", content: `КОНТЕКСТ ТЕКУЩЕГО ФАЙЛА:\n${context}\n\nЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${prompt}` }
-          ]
-        })
-      });
-      const data = await res.json();
-      const content = data?.choices?.[0]?.message?.content;
-      if (!content) return null;
-      return content.replace(/^```[a-z]*\n?/i, "").replace(/```$/i, "").trim();
+      const candidateModels = [
+        "google/gemini-2.0-flash-exp:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "deepseek/deepseek-r1:free",
+        "mistralai/mistral-7b-instruct:free",
+        "qwen/qwen-2.5-coder-32b-instruct:free"
+      ];
+
+      let lastError = "";
+      for (const model of candidateModels) {
+        try {
+          const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${apiKey}`,
+              "Content-Type": "application/json",
+              "HTTP-Referer": "https://oge-vyzhimka.github.io/vijimka-oge/",
+              "X-Title": "VyjimkaBot",
+            },
+            body: JSON.stringify({
+              model: model,
+              messages: [
+                { role: "system", content: systemInstruction },
+                { role: "user", content: `ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${prompt}\n\nФРАГМЕНТЫ КОДА ДЛЯ СПРАВКИ:\n${context.substring(0, 15000)}` }
+              ]
+            })
+          });
+
+          const data = await res.json();
+          if (!res.ok) {
+            lastError = data?.error?.message || `HTTP ${res.status}`;
+            continue;
+          }
+
+          const rawContent = data?.choices?.[0]?.message?.content?.trim();
+          if (!rawContent) continue;
+
+          // Clean json
+          const cleaned = rawContent.replace(/^```[a-z]*\n?/i, "").replace(/```$/i, "").trim();
+          try {
+            const parsed = JSON.parse(cleaned);
+            if (parsed.search && parsed.replace !== undefined) {
+              if (context.includes(parsed.search)) {
+                return { success: true, updatedCode: context.replace(parsed.search, parsed.replace) };
+              }
+              // Try trimming search
+              const trimmedSearch = parsed.search.trim();
+              if (context.includes(trimmedSearch)) {
+                return { success: true, updatedCode: context.replace(trimmedSearch, parsed.replace.trim()) };
+              }
+            }
+          } catch (_) {
+            // If model returned plain replacement instead of JSON
+            if (cleaned.length > 50 && cleaned.includes("<")) {
+              return { success: true, updatedCode: cleaned };
+            }
+          }
+        } catch (e) {
+          lastError = String(e);
+        }
+      }
+      return { success: false, error: lastError || "Все бесплатные модели OpenRouter временно перегружены. Попробуй через минуту." };
     }
 
     // 2. Groq (gsk_...)
@@ -169,16 +236,25 @@ async function askAI(prompt: string, context: string, apiKey: string) {
         },
         body: JSON.stringify({
           model: "llama-3.3-70b-versatile",
+          response_format: { type: "json_object" },
           messages: [
             { role: "system", content: systemInstruction },
-            { role: "user", content: `КОНТЕКСТ ТЕКУЩЕГО ФАЙЛА:\n${context}\n\nЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${prompt}` }
+            { role: "user", content: `ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${prompt}\n\nКОД ДЛЯ СПРАВКИ:\n${context.substring(0, 20000)}` }
           ]
         })
       });
       const data = await res.json();
-      const content = data?.choices?.[0]?.message?.content;
-      if (!content) return null;
-      return content.replace(/^```[a-z]*\n?/i, "").replace(/```$/i, "").trim();
+      if (!res.ok) {
+        return { success: false, error: data?.error?.message || `Groq Error ${res.status}` };
+      }
+      const raw = data?.choices?.[0]?.message?.content;
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed.search && parsed.replace !== undefined && context.includes(parsed.search.trim())) {
+          return { success: true, updatedCode: context.replace(parsed.search.trim(), parsed.replace.trim()) };
+        }
+      } catch (_) {}
+      return { success: false, error: "Не удалось найти точный фрагмент кода для замены. Попробуй указать конкретнее." };
     }
 
     // 3. Google Gemini (AIza...)
@@ -190,20 +266,27 @@ async function askAI(prompt: string, context: string, apiKey: string) {
         contents: [
           {
             role: "user",
-            parts: [
-              { text: `${systemInstruction}\n\nКОНТЕКСТ ТЕКУЩЕГО ФАЙЛА:\n${context}\n\nЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${prompt}` }
-            ]
+            parts: [{ text: `${systemInstruction}\n\nЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${prompt}\n\nКОД:\n${context.substring(0, 25000)}` }]
           }
         ]
       })
     });
     const data = await res.json();
+    if (!res.ok) {
+      return { success: false, error: data?.error?.message || `Gemini Error ${res.status}` };
+    }
     const answer = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!answer) return null;
-    return answer.replace(/^```[a-z]*\n?/i, "").replace(/```$/i, "").trim();
+    if (!answer) return { success: false, error: "Пустой ответ от Gemini." };
+    const cleaned = answer.replace(/^```[a-z]*\n?/i, "").replace(/```$/i, "").trim();
+    try {
+      const parsed = JSON.parse(cleaned);
+      if (parsed.search && parsed.replace !== undefined && context.includes(parsed.search.trim())) {
+        return { success: true, updatedCode: context.replace(parsed.search.trim(), parsed.replace.trim()) };
+      }
+    } catch (_) {}
+    return { success: false, error: "Не удалось сопоставить изменения в коде." };
   } catch (err) {
-    console.error("AI API error:", err);
-    return null;
+    return { success: false, error: String(err) };
   }
 }
 
@@ -354,7 +437,13 @@ Deno.serve(async (req: Request) => {
       const key = text.replace("/setkey ", "").trim();
       if (key.length > 8) {
         runtimeGeminiKey = key;
-        await sendTelegram(chatId, `✅ <b>AI-ключ успешно сохранен!</b> Теперь я могу вносить любые изменения в код сайта по твоим текстовым командам.`);
+        await sendTelegram(chatId, `⏳ Сохраняю ключ в облаке Supabase...`);
+        const saved = await saveSecret("GEMINI_API_KEY", key);
+        if (saved) {
+          await sendTelegram(chatId, `✅ <b>AI-ключ успешно сохранен в облаке насовсем!</b> Теперь я помню его 24/7 и готов менять код сайта по твоим текстовым командам.`);
+        } else {
+          await sendTelegram(chatId, `✅ <b>Ключ принят!</b> Готов к работе.`);
+        }
       } else {
         await sendTelegram(chatId, `❌ Неверный формат ключа.`);
       }
@@ -401,11 +490,12 @@ Deno.serve(async (req: Request) => {
       return new Response(JSON.stringify({ ok: true }));
     }
 
-    const updatedCode = await askAI(text, current.content, apiKey);
-    if (!updatedCode || updatedCode.length < 50) {
-      await sendTelegram(chatId, `⚠️ Нейросеть не смогла сформировать корректный код. Попробуй уточнить задачу.`);
+    const aiRes = await askAI(text, current.content, apiKey);
+    if (!aiRes.success || !aiRes.updatedCode || aiRes.updatedCode.length < 50) {
+      await sendTelegram(chatId, `⚠️ <b>Ошибка AI:</b> ${aiRes.error || "Нейросеть не смогла сформировать код. Попробуй переформулировать задачу."}`);
       return new Response(JSON.stringify({ ok: true }));
     }
+    const updatedCode = aiRes.updatedCode;
 
     await sendTelegram(chatId, `💾 Отправляю коммит в GitHub...`);
     const commitRes = await putGitHubFile(

@@ -1,0 +1,12 @@
+{
+  "name": "oge-telegram-bot",
+  "version": "1.0.0",
+  "description": "24/7 Cloud Telegram Bot for site management",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["telegram", "bot", "github-pages", "oge"],
+  "author": "alexeynezovsky",
+  "license": "MIT"
+}

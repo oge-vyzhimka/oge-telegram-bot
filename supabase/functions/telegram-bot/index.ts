@@ -268,17 +268,14 @@ async function askAI(prompt: string, context: string, apiKey: string, preferredM
               if (context.includes(parsed.search)) {
                 return { success: true, updatedCode: context.replace(parsed.search, parsed.replace) };
               }
-              // Try trimming search
               const trimmedSearch = parsed.search.trim();
               if (context.includes(trimmedSearch)) {
                 return { success: true, updatedCode: context.replace(trimmedSearch, parsed.replace.trim()) };
               }
             }
           } catch (_) {
-            // If model returned plain replacement instead of JSON
-            if (cleaned.length > 50 && cleaned.includes("<")) {
-              return { success: true, updatedCode: cleaned };
-            }
+            // Model returned explanatory or conversation text
+            return { success: false, isAnswer: true, message: cleaned };
           }
         } catch (e) {
           lastError = String(e);
@@ -656,42 +653,67 @@ Deno.serve(async (req: Request) => {
       return new Response(JSON.stringify({ ok: true }));
     }
 
-    await sendTelegram(chatId, `🧠 Обрабатываю задачу с помощью AI...\n<i>"${text}"</i>`);
+    // Run AI processing asynchronously via EdgeRuntime.waitUntil so Telegram never timeouts or retries
+    const processAiTask = async () => {
+      try {
+        await sendTelegram(chatId, `🧠 Обрабатываю задачу с помощью AI...\n<i>"${text}"</i>`);
 
-    // Default target is index.html
-    const targetFile = "index.html";
-    const current = await getGitHubFile(GITHUB_REPO, targetFile);
-    if (!current) {
-      await sendTelegram(chatId, `❌ Не удалось прочитать ${targetFile} с GitHub.`);
-      return new Response(JSON.stringify({ ok: true }));
-    }
+        // Smart target file detection
+        const lower = text.toLowerCase();
+        let targetFile = "index.html";
+        if (lower.includes("css") || lower.includes("стил") || lower.includes("цвет") || lower.includes("тем") || lower.includes("контур")) {
+          targetFile = "css/styles.css";
+        }
 
-    const aiRes = await askAI(text, current.content, apiKey, runtimeSelectedModel);
-    if (!aiRes.success || !aiRes.updatedCode || aiRes.updatedCode.length < 50) {
-      await sendTelegram(chatId, `⚠️ <b>Ошибка AI:</b> ${aiRes.error || "Нейросеть не смогла сформировать код. Попробуй переформулировать задачу."}`);
-      return new Response(JSON.stringify({ ok: true }));
-    }
-    const updatedCode = aiRes.updatedCode;
+        const current = await getGitHubFile(GITHUB_REPO, targetFile);
+        if (!current) {
+          await sendTelegram(chatId, `❌ Не удалось прочитать ${targetFile} с GitHub.`);
+          return;
+        }
 
-    await sendTelegram(chatId, `💾 Отправляю коммит в GitHub...`);
-    const commitRes = await putGitHubFile(
-      GITHUB_REPO,
-      targetFile,
-      updatedCode,
-      `[AI Bot 24/7] ${text.substring(0, 50)}`,
-      current.sha
-    );
+        const aiRes = await askAI(text, current.content, apiKey, runtimeSelectedModel);
+        if (aiRes.isAnswer && aiRes.message) {
+          await sendTelegram(chatId, `🤖 <b>Ответ нейросети:</b>\n\n${aiRes.message}`);
+          return;
+        }
+        if (!aiRes.success || !aiRes.updatedCode || aiRes.updatedCode.length < current.content.length * 0.7) {
+          await sendTelegram(chatId, `⚠️ <b>Ошибка AI:</b> ${aiRes.error || "Нейросеть не смогла внести безопасные изменения в файл. Попробуй конкретизировать задачу."}`);
+          return;
+        }
+        const updatedCode = aiRes.updatedCode;
 
-    if (commitRes && commitRes.commit) {
-      await sendTelegram(
-        chatId,
-        `🎉 <b>Готово! Изменения применены на сайте!</b>\n` +
-        `Коммит: <code>${commitRes.commit.sha?.substring(0, 7)}</code>\n` +
-        `Файл: <code>${targetFile}</code>\n` +
-        `Сайт обновится через минуту: <a href="https://oge-vyzhimka.github.io/vijimka-oge/">Открыть сайт</a>`
-      );
+        await sendTelegram(chatId, `💾 Отправляю коммит в GitHub...`);
+        const commitRes = await putGitHubFile(
+          GITHUB_REPO,
+          targetFile,
+          updatedCode,
+          `[AI Bot 24/7] ${text.substring(0, 50)}`,
+          current.sha
+        );
+
+        if (commitRes && commitRes.commit) {
+          await sendTelegram(
+            chatId,
+            `🎉 <b>Готово! Изменения применены на сайте!</b>\n` +
+            `Коммит: <code>${commitRes.commit.sha?.substring(0, 7)}</code>\n` +
+            `Файл: <code>${targetFile}</code>\n` +
+            `Сайт обновится через минуту: <a href="https://oge-vyzhimka.github.io/vijimka-oge/">Открыть сайт</a>`
+          );
+        } else {
+          await sendTelegram(chatId, `❌ Не удалось запушить коммит в GitHub. Проверь права токена.`);
+        }
+      } catch (err) {
+        console.error("AI task error:", err);
+        await sendTelegram(chatId, `⚠️ Ошибка при выполнении задачи: ${String(err)}`);
+      }
+    };
+
+    // @ts-ignore EdgeRuntime
+    if (typeof EdgeRuntime !== "undefined" && EdgeRuntime.waitUntil) {
+      // @ts-ignore EdgeRuntime
+      EdgeRuntime.waitUntil(processAiTask());
     } else {
-      await sendTelegram(chatId, `❌ Не удалось запушить коммит в GitHub. Проверь права токена.`);
+      processAiTask().catch(console.error);
     }
 
     return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });

@@ -166,7 +166,7 @@ Deno.serve(async (req: Request) => {
   // Health check / info
   if (req.method === "GET") {
     if (url.pathname.endsWith("/setWebhook")) {
-      const webhookUrl = `${url.origin}${url.pathname.replace(/\/setWebhook$/, "")}`;
+      const webhookUrl = "https://rkzzfszozgleeujkxzlb.supabase.co/functions/v1/telegram-bot";
       const tgRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${webhookUrl}`);
       const tgData = await tgRes.json();
       return new Response(JSON.stringify({ webhookUrl, telegram: tgData }, null, 2), {

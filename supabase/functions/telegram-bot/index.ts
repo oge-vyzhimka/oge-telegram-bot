@@ -130,12 +130,59 @@ async function checkSiteHealth() {
   }
 }
 
-async function askGemini(prompt: string, context: string, apiKey: string) {
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-    const systemInstruction = `Ты AI-разработчик сайта "Выжимка ОГЭ". Твоя задача — редактировать исходный код сайта по поручению владельца.
+async function askAI(prompt: string, context: string, apiKey: string) {
+  const systemInstruction = `Ты AI-разработчик сайта "Выжимка ОГЭ". Твоя задача — редактировать исходный код сайта по поручению владельца.
 Верни ТОЛЬКО обновленный готовый код файла целиком, без markdown блоков \`\`\` или лишних пояснений, чтобы код можно было сразу сохранить в репозиторий.`;
 
+  try {
+    // 1. OpenRouter (works in Russia, free models: meta-llama/llama-3.3-70b-instruct:free, google/gemini-2.0-flash-exp:free)
+    if (apiKey.startsWith("sk-or-")) {
+      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://oge-vyzhimka.github.io/vijimka-oge/",
+          "X-Title": "VyjimkaBot",
+        },
+        body: JSON.stringify({
+          model: "meta-llama/llama-3.3-70b-instruct:free",
+          messages: [
+            { role: "system", content: systemInstruction },
+            { role: "user", content: `КОНТЕКСТ ТЕКУЩЕГО ФАЙЛА:\n${context}\n\nЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${prompt}` }
+          ]
+        })
+      });
+      const data = await res.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content) return null;
+      return content.replace(/^```[a-z]*\n?/i, "").replace(/```$/i, "").trim();
+    }
+
+    // 2. Groq (gsk_...)
+    if (apiKey.startsWith("gsk_")) {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: "llama-3.3-70b-versatile",
+          messages: [
+            { role: "system", content: systemInstruction },
+            { role: "user", content: `КОНТЕКСТ ТЕКУЩЕГО ФАЙЛА:\n${context}\n\nЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${prompt}` }
+          ]
+        })
+      });
+      const data = await res.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content) return null;
+      return content.replace(/^```[a-z]*\n?/i, "").replace(/```$/i, "").trim();
+    }
+
+    // 3. Google Gemini (AIza...)
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -155,7 +202,7 @@ async function askGemini(prompt: string, context: string, apiKey: string) {
     if (!answer) return null;
     return answer.replace(/^```[a-z]*\n?/i, "").replace(/```$/i, "").trim();
   } catch (err) {
-    console.error("Gemini API error:", err);
+    console.error("AI API error:", err);
     return null;
   }
 }
@@ -305,9 +352,9 @@ Deno.serve(async (req: Request) => {
 
     if (text.startsWith("/setkey ")) {
       const key = text.replace("/setkey ", "").trim();
-      if (key.length > 10) {
+      if (key.length > 8) {
         runtimeGeminiKey = key;
-        await sendTelegram(chatId, `✅ <b>Ключ Gemini API успешно сохранен!</b> Теперь я могу вносить любые изменения в код сайта по твоим текстовым командам.`);
+        await sendTelegram(chatId, `✅ <b>AI-ключ успешно сохранен!</b> Теперь я могу вносить любые изменения в код сайта по твоим текстовым командам.`);
       } else {
         await sendTelegram(chatId, `❌ Неверный формат ключа.`);
       }
@@ -334,15 +381,17 @@ Deno.serve(async (req: Request) => {
       await sendTelegram(
         chatId,
         `🤖 Я получил твою задачу: <i>"${text}"</i>\n\n` +
-        `Чтобы я мог автоматически изменять код сайта нейросетью при выключенном ПК, подключи бесплатный ключ Google Gemini API:\n` +
-        `1. Перейди на <a href="https://aistudio.google.com/">aistudio.google.com</a> (Get API Key)\n` +
-        `2. Отправь мне команду: <code>/setkey ТВОЙ_КЛЮЧ</code>\n\n` +
-        `А пока ты можешь использовать команды <b>/status</b>, <b>/site</b>, <b>/redeploy</b>, <b>/announcement</b>!`
+        `Чтобы я мог изменять код сайта нейросетью при выключенном ПК, подключи бесплатный ключ <b>OpenRouter</b> (он работает в РФ без ограничений):\n` +
+        `1. Зайди на <a href="https://openrouter.ai/">openrouter.ai</a> и нажми Sign In (через Google или GitHub)\n` +
+        `2. Перейди в раздел Keys и создай ключ (начинается на <code>sk-or-...</code>)\n` +
+        `3. Отправь мне команду: <code>/setkey ТВОЙ_КЛЮЧ</code>\n\n` +
+        `<i>(Также поддерживаются ключи Groq или Google Gemini)</i>\n` +
+        `А команды <b>/status</b>, <b>/site</b>, <b>/redeploy</b>, <b>/file</b> работают уже сейчас без ключей!`
       );
       return new Response(JSON.stringify({ ok: true }));
     }
 
-    await sendTelegram(chatId, `🧠 Думаю над задачей с помощью Gemini 2.0 Flash...\n<i>"${text}"</i>`);
+    await sendTelegram(chatId, `🧠 Обрабатываю задачу с помощью AI...\n<i>"${text}"</i>`);
 
     // Default target is index.html
     const targetFile = "index.html";
@@ -352,7 +401,7 @@ Deno.serve(async (req: Request) => {
       return new Response(JSON.stringify({ ok: true }));
     }
 
-    const updatedCode = await askGemini(text, current.content, apiKey);
+    const updatedCode = await askAI(text, current.content, apiKey);
     if (!updatedCode || updatedCode.length < 50) {
       await sendTelegram(chatId, `⚠️ Нейросеть не смогла сформировать корректный код. Попробуй уточнить задачу.`);
       return new Response(JSON.stringify({ ok: true }));

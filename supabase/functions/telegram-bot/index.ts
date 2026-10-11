@@ -1,15 +1,112 @@
-// Supabase Edge Function: 24/7 Telegram Bot for "Выжимка ОГЭ"
+// Supabase Edge Function: 24/7 Telegram Bot for "Выжимка ОГЭ" & Remote PC Control
 // Runs in Supabase Cloud on Deno (Zero cold-start, 24/7 online even when PC is off)
 
 const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") || "";
 const GITHUB_TOKEN = Deno.env.get("GITHUB_TOKEN") || "";
 const GITHUB_REPO = Deno.env.get("GITHUB_REPO") || "oge-vyzhimka/vijimka-oge";
 const ADMIN_SECRET = Deno.env.get("ADMIN_SECRET") || "vyzhimka2026";
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
 
-// In-memory runtime cache for authorized users and optional Gemini key
-const authorizedChats = new Set<number>();
+// Strict Whitelist: Only these 3 usernames can access the bot
+const ALLOWED_USERNAMES = new Set(["vakuq", "k1slyy", "nezovsky"]);
+
 let runtimeGeminiKey = Deno.env.get("GEMINI_API_KEY") || "";
 let runtimeSelectedModel = Deno.env.get("ACTIVE_AI_MODEL") || "auto";
+
+// Database-backed PC Task Queue & Status
+async function updatePcHeartbeat(info?: unknown) {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
+    await fetch(`${SUPABASE_URL}/rest/v1/pc_status`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates"
+      },
+      body: JSON.stringify({
+        id: 1,
+        is_online: true,
+        last_seen: new Date().toISOString(),
+        info: info || {}
+      })
+    });
+  } catch (e) {
+    console.error("updatePcHeartbeat error:", e);
+  }
+}
+
+async function getPcOnlineStatus(): Promise<{ isOnline: boolean; info?: Record<string, unknown> }> {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return { isOnline: false };
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/pc_status?id=eq.1&select=last_seen,info`, {
+      headers: {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+      }
+    });
+    const rows = await res.json();
+    if (Array.isArray(rows) && rows.length > 0) {
+      const diff = Date.now() - new Date(rows[0].last_seen).getTime();
+      return { isOnline: diff < 30000, info: rows[0].info };
+    }
+  } catch (e) {
+    console.error("getPcOnlineStatus error:", e);
+  }
+  return { isOnline: false };
+}
+
+async function addPcTask(task: { chatId: number; username: string; type: string; instruction?: string; cmd?: string }) {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
+    await fetch(`${SUPABASE_URL}/rest/v1/pc_tasks`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        command: task.type,
+        payload: task,
+        status: "pending"
+      })
+    });
+  } catch (e) {
+    console.error("addPcTask error:", e);
+  }
+}
+
+async function popPcTask() {
+  try {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/pc_tasks?status=eq.pending&order=id.asc&limit=1`, {
+      headers: {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+      }
+    });
+    const rows = await res.json();
+    if (Array.isArray(rows) && rows.length > 0) {
+      const taskRow = rows[0];
+      await fetch(`${SUPABASE_URL}/rest/v1/pc_tasks?id=eq.${taskRow.id}`, {
+        method: "PATCH",
+        headers: {
+          "apikey": SUPABASE_SERVICE_ROLE_KEY,
+          "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ status: "processing" })
+      });
+      return { id: String(taskRow.id), ...taskRow.payload };
+    }
+  } catch (e) {
+    console.error("popPcTask error:", e);
+  }
+  return null;
+}
 
 async function sendTelegram(chatId: number, text: string, parseMode: string = "HTML", replyMarkup?: unknown) {
   try {
@@ -30,6 +127,32 @@ async function sendTelegram(chatId: number, text: string, parseMode: string = "H
     return await res.json();
   } catch (err) {
     console.error("Telegram send error:", err);
+    return null;
+  }
+}
+
+async function sendTelegramPhoto(chatId: number, base64Data: string, caption?: string) {
+  try {
+    const binary = atob(base64Data);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    const blob = new Blob([bytes], { type: "image/jpeg" });
+    const formData = new FormData();
+    formData.append("chat_id", String(chatId));
+    formData.append("photo", blob, "screen.jpg");
+    if (caption) {
+      formData.append("caption", caption);
+      formData.append("parse_mode", "HTML");
+    }
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+      method: "POST",
+      body: formData,
+    });
+    return await res.json();
+  } catch (err) {
+    console.error("sendPhoto error:", err);
     return null;
   }
 }
@@ -198,7 +321,7 @@ async function checkSiteHealth() {
   }
 }
 
-async function askAI(prompt: string, context: string, apiKey: string, preferredModel?: string): Promise<{ success: boolean; updatedCode?: string; error?: string }> {
+async function askAI(prompt: string, context: string, apiKey: string, preferredModel?: string): Promise<{ success: boolean; updatedCode?: string; error?: string; isAnswer?: boolean; message?: string }> {
   const systemInstruction = `Ты AI-разработчик сайта "Выжимка ОГЭ". Твоя задача — редактировать исходный код сайта (index.html) по поручению владельца.
 Файл большой. НЕ переписывай весь файл целиком!
 Найди конкретное место в коде, которое нужно изменить, и верни ТОЛЬКО валидный JSON (без markdown блоков \`\`\`) следующего формата:
@@ -208,31 +331,14 @@ async function askAI(prompt: string, context: string, apiKey: string, preferredM
 }`;
 
   try {
-    // 1. OpenRouter (sk-or-...)
     if (apiKey.startsWith("sk-or-")) {
-      let candidateModels: string[] = [];
-      try {
-        const modelsRes = await fetch("https://openrouter.ai/api/v1/models");
-        const modelsData = await modelsRes.json();
-        if (Array.isArray(modelsData.data)) {
-          candidateModels = modelsData.data
-            .filter((m: { id?: string; pricing?: { prompt?: string; completion?: string } }) => 
-              m.id?.endsWith(":free") || (m.pricing?.prompt === "0" && m.pricing?.completion === "0")
-            )
-            .map((m: { id: string }) => m.id);
-        }
-      } catch (_) {}
-
-      if (candidateModels.length === 0) {
-        candidateModels = ["qwen/qwen3.8-27b:free", "stealth/space-bunny-alpha", "nvidia/nemotron-3.5-lightning:free"];
-      }
-
+      let candidateModels: string[] = ["qwen/qwen3.8-27b:free", "stealth/space-bunny-alpha", "nvidia/nemotron-3.5-lightning:free"];
       if (preferredModel && preferredModel !== "auto") {
         candidateModels = [preferredModel, ...candidateModels.filter((m) => m !== preferredModel)];
       }
 
       let lastError = "";
-      for (const model of candidateModels.slice(0, 8)) {
+      for (const model of candidateModels.slice(0, 5)) {
         try {
           const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
             method: "POST",
@@ -260,7 +366,6 @@ async function askAI(prompt: string, context: string, apiKey: string, preferredM
           const rawContent = data?.choices?.[0]?.message?.content?.trim();
           if (!rawContent) continue;
 
-          // Clean json
           const cleaned = rawContent.replace(/^```[a-z]*\n?/i, "").replace(/```$/i, "").trim();
           try {
             const parsed = JSON.parse(cleaned);
@@ -274,48 +379,15 @@ async function askAI(prompt: string, context: string, apiKey: string, preferredM
               }
             }
           } catch (_) {
-            // Model returned explanatory or conversation text
             return { success: false, isAnswer: true, message: cleaned };
           }
         } catch (e) {
           lastError = String(e);
         }
       }
-      return { success: false, error: lastError || "Все бесплатные модели OpenRouter временно перегружены. Попробуй через минуту." };
+      return { success: false, error: lastError || "Модели OpenRouter временно недоступны." };
     }
 
-    // 2. Groq (gsk_...)
-    if (apiKey.startsWith("gsk_")) {
-      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: "llama-3.3-70b-versatile",
-          response_format: { type: "json_object" },
-          messages: [
-            { role: "system", content: systemInstruction },
-            { role: "user", content: `ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:\n${prompt}\n\nКОД ДЛЯ СПРАВКИ:\n${context.substring(0, 20000)}` }
-          ]
-        })
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        return { success: false, error: data?.error?.message || `Groq Error ${res.status}` };
-      }
-      const raw = data?.choices?.[0]?.message?.content;
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed.search && parsed.replace !== undefined && context.includes(parsed.search.trim())) {
-          return { success: true, updatedCode: context.replace(parsed.search.trim(), parsed.replace.trim()) };
-        }
-      } catch (_) {}
-      return { success: false, error: "Не удалось найти точный фрагмент кода для замены. Попробуй указать конкретнее." };
-    }
-
-    // 3. Google Gemini (AIza...)
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
     const res = await fetch(url, {
       method: "POST",
@@ -348,10 +420,52 @@ async function askAI(prompt: string, context: string, apiKey: string, preferredM
   }
 }
 
+// Main Deno server handler
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
 
-  // Health check / info
+  // 1. Endpoints for Local PC Agent
+  if (url.searchParams.get("agent_poll")) {
+    const sec = url.searchParams.get("secret");
+    if (sec !== ADMIN_SECRET) return new Response("Unauthorized", { status: 401 });
+    await updatePcHeartbeat();
+    const task = await popPcTask();
+    return new Response(JSON.stringify({ ok: true, task, pcOnline: true }), {
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
+  if (url.searchParams.get("agent_heartbeat")) {
+    const sec = url.searchParams.get("secret");
+    if (sec !== ADMIN_SECRET) return new Response("Unauthorized", { status: 401 });
+    try {
+      const info = await req.json();
+      await updatePcHeartbeat(info);
+    } catch (_) {
+      await updatePcHeartbeat();
+    }
+    return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+  }
+
+  if (url.searchParams.get("agent_result")) {
+    const sec = url.searchParams.get("secret");
+    if (sec !== ADMIN_SECRET) return new Response("Unauthorized", { status: 401 });
+    try {
+      const payload = await req.json();
+      if (payload.chatId) {
+        if (payload.photoBase64) {
+          await sendTelegramPhoto(payload.chatId, payload.photoBase64, payload.caption || "📸 <b>Снимок экрана ПК</b>\n<i>(Изображение просмотрено и удалено)</i>");
+        } else if (payload.message) {
+          await sendTelegram(payload.chatId, payload.message);
+        }
+      }
+    } catch (e) {
+      console.error("agent_result error:", e);
+    }
+    return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+  }
+
+  // 2. Health check & Webhook registration
   if (req.method === "GET") {
     if (url.pathname.endsWith("/setWebhook")) {
       const webhookUrl = "https://rkzzfszozgleeujkxzlb.supabase.co/functions/v1/telegram-bot";
@@ -361,43 +475,14 @@ Deno.serve(async (req: Request) => {
         headers: { "Content-Type": "application/json" },
       });
     }
-    if (url.pathname.endsWith("/checkModels")) {
-      const apiKey = Deno.env.get("GEMINI_API_KEY") || "";
-      const modelsRes = await fetch("https://openrouter.ai/api/v1/models");
-      const modelsData = await modelsRes.json();
-      const free = Array.isArray(modelsData.data)
-        ? modelsData.data
-            .filter((m: { id?: string; pricing?: { prompt?: string; completion?: string } }) => 
-              m.id?.endsWith(":free") || (m.pricing?.prompt === "0" && m.pricing?.completion === "0")
-            )
-            .map((m: { id: string }) => m.id)
-        : [];
 
-      let testResult = null;
-      if (apiKey && free.length > 0) {
-        const testRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${apiKey}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            model: free[0],
-            messages: [{ role: "user", content: "hi" }]
-          })
-        });
-        testResult = { model: free[0], status: testRes.status, data: await testRes.json() };
-      }
-      return new Response(JSON.stringify({ freeCount: free.length, freeList: free.slice(0, 15), testResult }, null, 2), {
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-
+    const { isOnline } = await getPcOnlineStatus();
     return new Response(
       JSON.stringify({
         status: "online",
-        service: "Выжимка ОГЭ Telegram Bot 24/7",
+        service: "Командный Центр (Выжимка ОГЭ + Управление ПК)",
         project: "rkzzfszozgleeujkxzlb",
+        pcOnline: isOnline,
         time: new Date().toISOString(),
       }),
       { headers: { "Content-Type": "application/json" } }
@@ -410,301 +495,472 @@ Deno.serve(async (req: Request) => {
 
   try {
     const update = await req.json();
+    const fromUser = ((update.message?.from?.username || update.callback_query?.from?.username || "") as string)
+      .toLowerCase()
+      .replace(/^@/, "");
 
-    // 1. Handle button clicks (callback_query)
+    const chatId = update.message?.chat?.id || update.callback_query?.message?.chat?.id;
+
+    // Strict Whitelist check
+    if (!ALLOWED_USERNAMES.has(fromUser)) {
+      if (chatId) {
+        await sendTelegram(
+          chatId,
+          `⛔ <b>Доступ ограничен.</b>\nЭтот бот работает только для администраторов (@vakuq, @k1slyy, @nezovsky).`
+        );
+      }
+      return new Response(JSON.stringify({ ok: true }));
+    }
+
+    // A. Handle Button Callbacks
     if (update.callback_query) {
       const cb = update.callback_query;
-      const chatId = cb.message.chat.id;
       const data = cb.data || "";
-      await answerCallbackQuery(cb.id, "Выбор принят!");
+      await answerCallbackQuery(cb.id);
+
+      if (data === "nav:main") {
+        const keyboard = {
+          inline_keyboard: [
+            [
+              { text: "🌐 Сайт «Выжимка ОГЭ»", callback_data: "nav:site" },
+              { text: "💻 Управление ПК", callback_data: "nav:pc" }
+            ],
+            [
+              { text: "📊 Статус системы", callback_data: "nav:status" }
+            ]
+          ]
+        };
+        await sendTelegram(
+          chatId,
+          `👋 <b>Главное меню командного центра</b>\n\n` +
+          `Авторизован: <b>@${fromUser}</b> 🟢\n\n` +
+          `Выберите направление для работы:`,
+          "HTML",
+          keyboard
+        );
+        return new Response(JSON.stringify({ ok: true }));
+      }
+
+      if (data === "nav:site") {
+        const keyboard = {
+          inline_keyboard: [
+            [
+              { text: "🤖 Выбор AI-модели", callback_data: "site:models" },
+              { text: "📊 Статус сайта", callback_data: "site:check" }
+            ],
+            [
+              { text: "🔄 Перезапустить деплой", callback_data: "site:redeploy" },
+              { text: "⏪ Откатить коммит", callback_data: "site:rollback" }
+            ],
+            [
+              { text: "🔙 Главное меню", callback_data: "nav:main" }
+            ]
+          ]
+        };
+        await sendTelegram(
+          chatId,
+          `🌐 <b>Управление сайтом «Выжимка ОГЭ»</b>\n\n` +
+          `<b>Актуальные команды:</b>\n` +
+          `🤖 <b>/ai</b> — выбор нейросети для правок сайта\n` +
+          `📊 <b>/status</b> — проверка работы сайта и последний коммит\n` +
+          `🌐 <b>/site</b> — открыть ссылку на сайт\n` +
+          `🔄 <b>/redeploy</b> — перезапустить деплой на GitHub\n` +
+          `📢 <b>/announcement ТЕКСТ</b> — повесить объявление на сайте\n` +
+          `⏪ <b>/rollback</b> — откат последнего коммита\n` +
+          `📄 <b>/file ПУТЬ</b> — посмотреть файл в репозитории\n\n` +
+          `💡 <i>Напишите задачу текстом, чтобы ИИ изменил код сайта!</i>`,
+          "HTML",
+          keyboard
+        );
+        return new Response(JSON.stringify({ ok: true }));
+      }
+
+      if (data === "nav:pc") {
+        const { isOnline } = await getPcOnlineStatus();
+        const statusBadge = isOnline ? "🟢 В сети (Готов к действиям)" : "🔴 Не в сети (ПК выключен / агент спит)";
+        const keyboard = {
+          inline_keyboard: [
+            [
+              { text: "📸 Что на экране?", callback_data: "pc:screen" },
+              { text: "⚡ Меню питания", callback_data: "pc:power" }
+            ],
+            [
+              { text: "📊 Характеристики ПК", callback_data: "pc:info" }
+            ],
+            [
+              { text: "🔙 Главное меню", callback_data: "nav:main" }
+            ]
+          ]
+        };
+        await sendTelegram(
+          chatId,
+          `💻 <b>Управление ПК (ИИ-Агент)</b>\n\n` +
+          `Статус компьютера: <b>${statusBadge}</b>\n\n` +
+          `<b>Доступные команды:</b>\n` +
+          `📸 <b>/screen</b> — сделать скриншот экрана (ИИ посмотрит и пришлет в чат)\n` +
+          `💻 <b>/cmd КОМАНДА</b> — выполнить команду PowerShell на ПК\n` +
+          `⚡ <b>/power</b> — управление питанием (выключение, перезагрузка, сон)\n\n` +
+          `🧠 <b>Умные действия голосом/текстом:</b>\n` +
+          `Напишите задачу обычными словами: <i>«закрой окно»</i>, <i>«нажми Играть»</i>, <i>«посмотри что открыто»</i>. ИИ посмотрит на экран, нажмет нужную кнопку и тут же сотрет снимок!`,
+          "HTML",
+          keyboard
+        );
+        return new Response(JSON.stringify({ ok: true }));
+      }
+
+      if (data === "pc:screen") {
+        const { isOnline } = await getPcOnlineStatus();
+        if (!isOnline) {
+          await sendTelegram(chatId, `⚠️ <b>ПК сейчас оффлайн.</b> Включите компьютер или запустите агента.`);
+          return new Response(JSON.stringify({ ok: true }));
+        }
+        await addPcTask({
+          chatId,
+          username: fromUser,
+          type: "screen"
+        });
+        await sendTelegram(chatId, `📸 <b>Делаю снимок экрана...</b> Подождите 1-2 секунды.`);
+        return new Response(JSON.stringify({ ok: true }));
+      }
+
+      if (data === "pc:power") {
+        const keyboard = {
+          inline_keyboard: [
+            [
+              { text: "🔴 Выключить ПК", callback_data: "pwr:shutdown" },
+              { text: "🔄 Перезагрузить", callback_data: "pwr:reboot" }
+            ],
+            [
+              { text: "🌙 Спящий режим", callback_data: "pwr:sleep" },
+              { text: "🔒 Заблокировать", callback_data: "pwr:lock" }
+            ],
+            [
+              { text: "🔙 Назад в меню ПК", callback_data: "nav:pc" }
+            ]
+          ]
+        };
+        await sendTelegram(chatId, `⚡ <b>Меню питания компьютера:</b>\nВыберите действие:`, "HTML", keyboard);
+        return new Response(JSON.stringify({ ok: true }));
+      }
+
+      if (data.startsWith("pwr:")) {
+        const action = data.replace("pwr:", "");
+        const { isOnline } = await getPcOnlineStatus();
+        if (!isOnline) {
+          await sendTelegram(chatId, `⚠️ ПК оффлайн. Команду отправить невозможно.`);
+          return new Response(JSON.stringify({ ok: true }));
+        }
+        await addPcTask({
+          chatId,
+          username: fromUser,
+          type: "power",
+          instruction: action
+        });
+        await sendTelegram(chatId, `⚡ <b>Команда отправлена на ПК:</b> <code>${action}</code>`);
+        return new Response(JSON.stringify({ ok: true }));
+      }
+
+      if (data === "pc:info") {
+        const { isOnline, info } = await getPcOnlineStatus();
+        if (!isOnline) {
+          await sendTelegram(chatId, `🔴 <b>ПК сейчас оффлайн.</b>`);
+          return new Response(JSON.stringify({ ok: true }));
+        }
+        let infoMsg = `📊 <b>Состояние ПК:</b> 🟢 Онлайн\n\n`;
+        if (info?.freeDiskGB !== undefined) infoMsg += `• Свободно на диске C:: <b>${info.freeDiskGB} ГБ</b>\n`;
+        if (info?.activeWindow) infoMsg += `• Активное окно: <i>${info.activeWindow}</i>\n`;
+        await sendTelegram(chatId, infoMsg);
+        return new Response(JSON.stringify({ ok: true }));
+      }
+
+      if (data === "site:models") {
+        const keyboard = {
+          inline_keyboard: [
+            [{ text: "🌟 Лучший вариант (Автовыбор) — 100% 🟢", callback_data: "model:auto" }],
+            [{ text: "🐰 Space Bunny Alpha — 99% 🟢", callback_data: "model:stealth/space-bunny-alpha" }],
+            [{ text: "⚡ Nvidia Nemotron — 97% 🟢", callback_data: "model:nvidia/nemotron-3.5-lightning:free" }],
+            [{ text: "🧠 Qwen 3.8 Coding — 95% 🟢", callback_data: "model:qwen/qwen3.8-27b:free" }],
+            [{ text: "🔙 В меню сайта", callback_data: "nav:site" }]
+          ]
+        };
+        await sendTelegram(chatId, `🤖 <b>Выбор AI-модели для сайта:</b>`, "HTML", keyboard);
+        return new Response(JSON.stringify({ ok: true }));
+      }
+
       if (data.startsWith("model:")) {
         const modelId = data.replace("model:", "");
         runtimeSelectedModel = modelId;
         await saveSecret("ACTIVE_AI_MODEL", modelId);
-        const nameMap: Record<string, string> = {
-          "auto": "🌟 Лучший вариант (Автовыбор) — 100% 🟢",
-          "stealth/space-bunny-alpha": "🐰 Space Bunny Alpha — 99% 🟢",
-          "nvidia/nemotron-3.5-lightning:free": "⚡ Nvidia Nemotron — 97% 🟢",
-          "qwen/qwen3.8-27b:free": "🧠 Qwen 3.8 Coding — 95% 🟢",
-          "liquid/lfm-2.5-2.6b:free": "🌊 Liquid LFM 2.5 — 92% 🟢",
-          "inclusionai/ling-3.0-flash-sante:free": "✨ Ling 3.0 Flash — 89% 🟡",
-        };
-        const prettyName = nameMap[modelId] || modelId;
-        await sendTelegram(
-          chatId,
-          `🎯 <b>Модель AI переключена!</b>\n\n` +
-          `Активная нейросеть: <b>${prettyName}</b>\n\n` +
-          `Теперь просто напиши задачу в чат (например: <i>«поменяй заголовок на...»</i>), и бот изменит код сайта этой моделью!`
-        );
+        await sendTelegram(chatId, `🎯 Модель переключена на: <code>${modelId}</code>`);
+        return new Response(JSON.stringify({ ok: true }));
       }
+
+      if (data === "site:check" || data === "nav:status") {
+        const [commit, health, pcStatus] = await Promise.all([
+          getGitHubCommit(GITHUB_REPO),
+          checkSiteHealth(),
+          getPcOnlineStatus()
+        ]);
+        const healthIcon = health.ok ? "🟢" : "🔴";
+        const pcIcon = pcStatus.isOnline ? "🟢 В сети" : "🔴 Оффлайн";
+
+        let msg = `📊 <b>Статус всей системы:</b>\n\n`;
+        msg += `💻 <b>Компьютер:</b> ${pcIcon}\n`;
+        msg += `🌐 <b>Сайт ОГЭ:</b> ${healthIcon} ${health.ok ? "Работает" : "Ошибка"} (${health.ms}ms)\n`;
+        if (commit) {
+          msg += `📦 <b>Коммит:</b> <code>${commit.sha}</code> (<i>${commit.message}</i>)\n`;
+        }
+        await sendTelegram(chatId, msg);
+        return new Response(JSON.stringify({ ok: true }));
+      }
+
+      if (data === "site:redeploy") {
+        await sendTelegram(chatId, `🔄 Отправляю сигнал на пересборку сайта в GitHub Pages...`);
+        const res = await triggerRedeploy(GITHUB_REPO);
+        if (res && res.commit) {
+          await sendTelegram(chatId, `✅ <b>Сигнал отправлен!</b> Сайт обновится через 30-60 секунд.`);
+        } else {
+          await sendTelegram(chatId, `⚠️ Ошибка триггера GitHub.`);
+        }
+        return new Response(JSON.stringify({ ok: true }));
+      }
+
+      if (data === "site:rollback") {
+        await sendTelegram(chatId, `⏪ Откатываю коммит...`);
+        const rb = await rollbackCommit(GITHUB_REPO);
+        if (rb) {
+          await sendTelegram(chatId, `✅ <b>Откат успешен!</b> Отменен коммит: <code>${rb.revertedSha}</code>`);
+        } else {
+          await sendTelegram(chatId, `⚠️ Не удалось выполнить откат.`);
+        }
+        return new Response(JSON.stringify({ ok: true }));
+      }
+
       return new Response(JSON.stringify({ ok: true }));
     }
 
+    // B. Handle Text Messages
     const message = update.message;
-
     if (!message || !message.text) {
-      return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({ ok: true }));
     }
 
-    const chatId = message.chat.id;
     const text = message.text.trim();
-    const sender = message.from?.first_name || "Пользователь";
 
-    // Auto-authorize first user or check passkey
-    if (authorizedChats.size === 0) {
-      authorizedChats.add(chatId);
-    }
+    // /start command
+    if (text === "/start" || text === "/help" || text === "/menu") {
+      const { isOnline } = await getPcOnlineStatus();
+      const pcBadge = isOnline ? "🟢 В сети" : "🔴 Оффлайн";
 
-    if (text.startsWith("/auth")) {
-      const pass = text.split(" ")[1];
-      if (pass === ADMIN_SECRET) {
-        authorizedChats.add(chatId);
-        await sendTelegram(chatId, `✅ <b>Авторизация успешна!</b> Привет, ${sender}! Теперь у тебя полный доступ к управлению сайтом.`);
-      } else {
-        await sendTelegram(chatId, `❌ Неверный пароль. Используй: <code>/auth vyzhimka2026</code>`);
-      }
-      return new Response(JSON.stringify({ ok: true }));
-    }
+      const welcomeMsg = `🤖 <b>Командный центр администратора</b>\n\n` +
+        `Привет, <b>@${fromUser}</b>! Бот готов к работе.\n` +
+        `Статус ПК: <b>${pcBadge}</b>\n\n` +
+        `<b>Выберите направление:</b>\n` +
+        `🌐 <b>Сайт «Выжимка ОГЭ»</b> — управление кодом, деплой, AI-модели, баннеры\n` +
+        `💻 <b>Управление ПК</b> — скриншоты, умные действия ИИ, консоль, питание\n\n` +
+        `<i>(Выберите нужный раздел кнопками ниже)</i>`;
 
-    if (!authorizedChats.has(chatId)) {
-      await sendTelegram(
-        chatId,
-        `🔒 <b>Бот защищен.</b> Пожалуйста, авторизуйся командой:\n<code>/auth vyzhimka2026</code>`
-      );
-      return new Response(JSON.stringify({ ok: true }));
-    }
-
-    // Command handling
-    if (text === "/start" || text === "/help") {
-      const helpMsg = `🚀 <b>Панель управления сайтом «Выжимка ОГЭ» (24/7 Облако)</b>\n\n` +
-        `Бот работает автономно в облаке <b>Supabase</b> и доступен даже когда твой ПК выключен!\n\n` +
-        `<b>Доступные команды:</b>\n` +
-        `🤖 <b>/ai</b> — выбор нейросети и проценты доступности\n` +
-        `⏪ <b>/rollback</b> — мгновенный откат изменений назад\n` +
-        `📊 <b>/status</b> — проверка работы сайта и последний коммит\n` +
-        `🌐 <b>/site</b> — открыть ссылку на сайт\n` +
-        `🔄 <b>/redeploy</b> — перезапустить деплой на GitHub\n` +
-        `📢 <b>/announcement ТЕКСТ</b> — повесить объявление на сайте\n` +
-        `📄 <b>/file ПУТЬ</b> — посмотреть файл из репозитория (напр. <code>/file index.html</code>)\n` +
-        `🔑 <b>/setkey КЛЮЧ</b> — обновить API ключ для нейросети\n\n` +
-        `💡 <b>Управление сайтом голосом или текстом:</b>\n` +
-        `Просто напиши задачу своими словами (например: <i>«поменяй заголовок в index.html на...»</i>), и бот внесет изменения в GitHub!`;
-
-      await sendTelegram(chatId, helpMsg);
-      return new Response(JSON.stringify({ ok: true }));
-    }
-
-    if (text === "/ai" || text === "/models" || text === "/model") {
       const keyboard = {
         inline_keyboard: [
           [
-            { text: "🌟 (Рекомендуется) Лучший вариант — 100% 🟢", callback_data: "model:auto" }
+            { text: "🌐 Сайт «Выжимка ОГЭ»", callback_data: "nav:site" },
+            { text: "💻 Управление ПК", callback_data: "nav:pc" }
           ],
           [
-            { text: "🐰 Space Bunny Alpha — 99% 🟢", callback_data: "model:stealth/space-bunny-alpha" }
-          ],
-          [
-            { text: "⚡ Nvidia Nemotron — 97% 🟢", callback_data: "model:nvidia/nemotron-3.5-lightning:free" }
-          ],
-          [
-            { text: "🧠 Qwen 3.8 Coding — 95% 🟢", callback_data: "model:qwen/qwen3.8-27b:free" }
-          ],
-          [
-            { text: "🌊 Liquid LFM 2.5 — 92% 🟢", callback_data: "model:liquid/lfm-2.5-2.6b:free" }
-          ],
-          [
-            { text: "✨ Ling 3.0 Flash — 89% 🟡", callback_data: "model:inclusionai/ling-3.0-flash-sante:free" }
+            { text: "📸 Быстрый скриншот ПК", callback_data: "pc:screen" },
+            { text: "📊 Статус системы", callback_data: "nav:status" }
           ]
         ]
       };
-      await sendTelegram(
-        chatId,
-        `🤖 <b>Выбор нейросети для сайта:</b>\n\n` +
-        `Текущий режим: <code>${runtimeSelectedModel}</code>\n\n` +
-        `Выбери нейросеть нажатием на кнопку ниже.\n` +
-        `<i>Проценты показывают стабильность и скорость работы в реальном времени:</i>`,
-        "HTML",
-        keyboard
-      );
+
+      await sendTelegram(chatId, welcomeMsg, "HTML", keyboard);
       return new Response(JSON.stringify({ ok: true }));
     }
 
-    if (text === "/rollback") {
-      await sendTelegram(chatId, `⏪ Откатываю последний коммит на GitHub...`);
-      const rb = await rollbackCommit(GITHUB_REPO);
-      if (rb) {
-        await sendTelegram(
-          chatId,
-          `✅ <b>Откат выполнен успешно!</b>\n` +
-          `Отменен коммит: <code>${rb.revertedSha}</code> (<i>${rb.revertedMsg}</i>)\n` +
-          `Восстановлен коммит: <code>${rb.restoredSha}</code> (<i>${rb.restoredMsg}</i>)\n` +
-          `Сайт вернется к предыдущей версии через 30-60 секунд!`
-        );
-      } else {
-        await sendTelegram(chatId, `⚠️ Не удалось выполнить откат. Проверь GitHub.`);
+    if (text === "/pc") {
+      const { isOnline } = await getPcOnlineStatus();
+      const statusBadge = isOnline ? "🟢 В сети" : "🔴 Оффлайн";
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: "📸 Что на экране?", callback_data: "pc:screen" },
+            { text: "⚡ Питание", callback_data: "pc:power" }
+          ],
+          [
+            { text: "🔙 Главное меню", callback_data: "nav:main" }
+          ]
+        ]
+      };
+      await sendTelegram(chatId, `💻 <b>Управление ПК:</b> ${statusBadge}\nНапишите задачу текстом или выберите кнопку:`, "HTML", keyboard);
+      return new Response(JSON.stringify({ ok: true }));
+    }
+
+    if (text === "/screen" || text.toLowerCase() === "скрин" || text.toLowerCase() === "экран") {
+      const { isOnline } = await getPcOnlineStatus();
+      if (!isOnline) {
+        await sendTelegram(chatId, `⚠️ <b>Компьютер сейчас оффлайн.</b> Включите ПК или запустите агента.`);
+        return new Response(JSON.stringify({ ok: true }));
       }
+      await addPcTask({
+        chatId,
+        username: fromUser,
+        type: "screen"
+      });
+      await sendTelegram(chatId, `📸 <b>Делаю снимок экрана...</b> Секунду.`);
+      return new Response(JSON.stringify({ ok: true }));
+    }
+
+    if (text === "/power") {
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: "🔴 Выключить", callback_data: "pwr:shutdown" },
+            { text: "🔄 Перезагрузить", callback_data: "pwr:reboot" }
+          ],
+          [
+            { text: "🌙 Сон", callback_data: "pwr:sleep" },
+            { text: "🔒 Блокировка", callback_data: "pwr:lock" }
+          ]
+        ]
+      };
+      await sendTelegram(chatId, `⚡ <b>Управление питанием ПК:</b>`, "HTML", keyboard);
+      return new Response(JSON.stringify({ ok: true }));
+    }
+
+    if (text.startsWith("/cmd ")) {
+      const cmdStr = text.replace("/cmd ", "").trim();
+      const { isOnline } = await getPcOnlineStatus();
+      if (!isOnline) {
+        await sendTelegram(chatId, `⚠️ ПК оффлайн. Невозможно выполнить команду.`);
+        return new Response(JSON.stringify({ ok: true }));
+      }
+      await addPcTask({
+        chatId,
+        username: fromUser,
+        type: "cmd",
+        cmd: cmdStr
+      });
+      await sendTelegram(chatId, `⏳ Выполняю команду в PowerShell:\n<code>${cmdStr}</code>...`);
       return new Response(JSON.stringify({ ok: true }));
     }
 
     if (text === "/site") {
-      await sendTelegram(
-        chatId,
-        `🌐 <b>Сайт Выжимка ОГЭ:</b>\n👉 <a href="https://oge-vyzhimka.github.io/vijimka-oge/">https://oge-vyzhimka.github.io/vijimka-oge/</a>`
-      );
+      await sendTelegram(chatId, `🌐 <b>Ссылка:</b> https://oge-vyzhimka.github.io/vijimka-oge/`);
       return new Response(JSON.stringify({ ok: true }));
     }
 
     if (text === "/status") {
-      await sendTelegram(chatId, `⏳ Проверяю статус сайта и GitHub...`);
-      const [commit, health] = await Promise.all([
-        getGitHubCommit(GITHUB_REPO),
-        checkSiteHealth(),
-      ]);
-
+      const [commit, health] = await Promise.all([getGitHubCommit(GITHUB_REPO), checkSiteHealth()]);
       const healthIcon = health.ok ? "🟢" : "🔴";
-      let msg = `📊 <b>Статус сайта «Выжимка ОГЭ»:</b>\n\n`;
-      msg += `${healthIcon} <b>Сайт онлайн:</b> ${health.ok ? "Работает отлично" : "Ошибка"} (${health.status}, ${health.ms}ms)\n`;
-      msg += `🌐 <b>Ссылка:</b> https://oge-vyzhimka.github.io/vijimka-oge/\n\n`;
-
-      if (commit) {
-        msg += `📦 <b>Последний коммит:</b>\n`;
-        msg += `• Хэш: <code>${commit.sha}</code>\n`;
-        msg += `• Сообщение: <i>${commit.message}</i>\n`;
-        msg += `• Автор: ${commit.author}\n`;
-        msg += `• Время: ${commit.date} (МСК)\n`;
-      }
-      msg += `\n⚡ <i>Сервер бота: Supabase Edge 24/7 (ПК не требуется)</i>`;
-
+      let msg = `📊 <b>Статус сайта:</b> ${healthIcon} (${health.status}, ${health.ms}ms)\n`;
+      if (commit) msg += `📦 Коммит <code>${commit.sha}</code>: <i>${commit.message}</i>\n`;
       await sendTelegram(chatId, msg);
       return new Response(JSON.stringify({ ok: true }));
     }
 
     if (text === "/redeploy") {
-      await sendTelegram(chatId, `🔄 Отправляю сигнал на пересборку в GitHub...`);
-      const res = await triggerRedeploy(GITHUB_REPO);
-      if (res && res.commit) {
-        await sendTelegram(
-          chatId,
-          `✅ <b>Успешно!</b> Сигнал деплоя отправлен (коммит <code>${res.commit.sha?.substring(0, 7)}</code>).\nGitHub Pages обновит сайт в течение 30-60 секунд!`
-        );
-      } else {
-        await sendTelegram(chatId, `⚠️ Не удалось отправить триггер деплоя. Ошибка GitHub API.`);
-      }
+      await sendTelegram(chatId, `🔄 Сигнал на пересборку отправлен.`);
+      await triggerRedeploy(GITHUB_REPO);
       return new Response(JSON.stringify({ ok: true }));
     }
 
-    if (text.startsWith("/file ")) {
-      const filePath = text.replace("/file ", "").trim();
-      await sendTelegram(chatId, `🔍 Ищу файл <code>${filePath}</code> на GitHub...`);
-      const file = await getGitHubFile(GITHUB_REPO, filePath);
-      if (file) {
-        const preview = file.content.length > 3000 ? file.content.substring(0, 3000) + "\n...[обрезано]" : file.content;
-        await sendTelegram(chatId, `📄 <b>Содержимое ${filePath}:</b>\n<pre>${preview.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>`);
-      } else {
-        await sendTelegram(chatId, `❌ Файл <code>${filePath}</code> не найден в репозитории.`);
-      }
+    if (text === "/rollback") {
+      const rb = await rollbackCommit(GITHUB_REPO);
+      if (rb) await sendTelegram(chatId, `✅ <b>Откат успешен:</b> <code>${rb.revertedSha}</code>`);
+      else await sendTelegram(chatId, `⚠️ Ошибка отката.`);
       return new Response(JSON.stringify({ ok: true }));
     }
 
     if (text.startsWith("/setkey ")) {
       const key = text.replace("/setkey ", "").trim();
-      if (key.length > 8) {
-        runtimeGeminiKey = key;
-        await sendTelegram(chatId, `⏳ Сохраняю ключ в облаке Supabase...`);
-        const saved = await saveSecret("GEMINI_API_KEY", key);
-        if (saved) {
-          await sendTelegram(chatId, `✅ <b>AI-ключ успешно сохранен в облаке насовсем!</b> Теперь я помню его 24/7 и готов менять код сайта по твоим текстовым командам.`);
-        } else {
-          await sendTelegram(chatId, `✅ <b>Ключ принят!</b> Готов к работе.`);
-        }
-      } else {
-        await sendTelegram(chatId, `❌ Неверный формат ключа.`);
-      }
+      runtimeGeminiKey = key;
+      await saveSecret("GEMINI_API_KEY", key);
+      await sendTelegram(chatId, `✅ <b>Ключ сохранен в облаке!</b>`);
       return new Response(JSON.stringify({ ok: true }));
     }
 
     if (text.startsWith("/announcement ")) {
       const annText = text.replace("/announcement ", "").trim();
-      await sendTelegram(chatId, `📢 Публикую объявление на сайте: <i>"${annText}"</i>...`);
       const annJson = JSON.stringify({ active: true, text: annText, updatedAt: new Date().toISOString() }, null, 2);
       const cur = await getGitHubFile(GITHUB_REPO, "announcement.json");
-      const res = await putGitHubFile(GITHUB_REPO, "announcement.json", annJson, `[Bot 24/7] Update announcement: ${annText.substring(0, 30)}`, cur?.sha);
-      if (res && res.commit) {
-        await sendTelegram(chatId, `✅ <b>Объявление опубликовано!</b> Сохранено в <code>announcement.json</code> на GitHub.`);
-      } else {
-        await sendTelegram(chatId, `❌ Ошибка публикации объявления.`);
-      }
+      await putGitHubFile(GITHUB_REPO, "announcement.json", annJson, `[Bot] Update announcement`, cur?.sha);
+      await sendTelegram(chatId, `✅ <b>Объявление опубликовано на сайте!</b>`);
       return new Response(JSON.stringify({ ok: true }));
     }
 
-    // Natural Language AI code modifications
-    const apiKey = runtimeGeminiKey || Deno.env.get("GEMINI_API_KEY");
-    if (!apiKey) {
+    // Natural Language Routing: Check if it's a PC task or a Website task
+    const lower = text.toLowerCase();
+    const isPcAction = [
+      "экран", "закрой", "открой", "нажми", "клик", "сверни", "видео", "браузер",
+      "включи", "выключи", "сделай", "посмотри", "мышь", "курсор", "плей", "играть",
+      "запусти", "перезагрузи", "сверни", "папку", "диспетчер"
+    ].some((w) => lower.includes(w));
+
+    if (isPcAction) {
+      const { isOnline } = await getPcOnlineStatus();
+      if (!isOnline) {
+        await sendTelegram(
+          chatId,
+          `⚠️ <b>Компьютер сейчас оффлайн.</b>\n` +
+          `Чтобы ИИ мог управлять экраном, запустите агента на ПК.`
+        );
+        return new Response(JSON.stringify({ ok: true }));
+      }
+
+      await addPcTask({
+        chatId,
+        username: fromUser,
+        type: "ai_action",
+        instruction: text
+      });
+
       await sendTelegram(
         chatId,
-        `🤖 Я получил твою задачу: <i>"${text}"</i>\n\n` +
-        `Чтобы я мог изменять код сайта нейросетью при выключенном ПК, подключи бесплатный ключ <b>OpenRouter</b> (он работает в РФ без ограничений):\n` +
-        `1. Зайди на <a href="https://openrouter.ai/">openrouter.ai</a> и нажми Sign In (через Google или GitHub)\n` +
-        `2. Перейди в раздел Keys и создай ключ (начинается на <code>sk-or-...</code>)\n` +
-        `3. Отправь мне команду: <code>/setkey ТВОЙ_КЛЮЧ</code>\n\n` +
-        `<i>(Также поддерживаются ключи Groq или Google Gemini)</i>\n` +
-        `А команды <b>/status</b>, <b>/site</b>, <b>/redeploy</b>, <b>/file</b> работают уже сейчас без ключей!`
+        `🧠 <b>ИИ анализирует экран...</b>\nЗадача: <i>"${text}"</i>\n` +
+        `<i>(Скриншот делается, анализируется, выполняется действие и сразу удаляется)</i>`
       );
       return new Response(JSON.stringify({ ok: true }));
     }
 
-    // Run AI processing asynchronously via EdgeRuntime.waitUntil so Telegram never timeouts or retries
+    // Else: Website AI Task
+    const apiKey = runtimeGeminiKey || Deno.env.get("GEMINI_API_KEY");
+    if (!apiKey) {
+      await sendTelegram(
+        chatId,
+        `🤖 Задача для сайта: <i>"${text}"</i>\nДля изменения кода подключите ключ OpenRouter: <code>/setkey КЛЮЧ</code>`
+      );
+      return new Response(JSON.stringify({ ok: true }));
+    }
+
     const processAiTask = async () => {
       try {
-        await sendTelegram(chatId, `🧠 Обрабатываю задачу с помощью AI...\n<i>"${text}"</i>`);
-
-        // Smart target file detection
-        const lower = text.toLowerCase();
+        await sendTelegram(chatId, `🧠 Применяю правки на сайте...\n<i>"${text}"</i>`);
         let targetFile = "index.html";
-        if (lower.includes("css") || lower.includes("стил") || lower.includes("цвет") || lower.includes("тем") || lower.includes("контур")) {
+        if (lower.includes("css") || lower.includes("стил") || lower.includes("цвет") || lower.includes("тем")) {
           targetFile = "css/styles.css";
         }
-
         const current = await getGitHubFile(GITHUB_REPO, targetFile);
         if (!current) {
-          await sendTelegram(chatId, `❌ Не удалось прочитать ${targetFile} с GitHub.`);
+          await sendTelegram(chatId, `❌ Не удалось прочитать ${targetFile}.`);
           return;
         }
-
         const aiRes = await askAI(text, current.content, apiKey, runtimeSelectedModel);
         if (aiRes.isAnswer && aiRes.message) {
-          await sendTelegram(chatId, `🤖 <b>Ответ нейросети:</b>\n\n${aiRes.message}`);
+          await sendTelegram(chatId, `🤖 <b>Ответ:</b>\n${aiRes.message}`);
           return;
         }
-        if (!aiRes.success || !aiRes.updatedCode || aiRes.updatedCode.length < current.content.length * 0.7) {
-          await sendTelegram(chatId, `⚠️ <b>Ошибка AI:</b> ${aiRes.error || "Нейросеть не смогла внести безопасные изменения в файл. Попробуй конкретизировать задачу."}`);
+        if (!aiRes.success || !aiRes.updatedCode) {
+          await sendTelegram(chatId, `⚠️ ${aiRes.error || "Ошибка изменения кода."}`);
           return;
         }
-        const updatedCode = aiRes.updatedCode;
-
-        await sendTelegram(chatId, `💾 Отправляю коммит в GitHub...`);
-        const commitRes = await putGitHubFile(
-          GITHUB_REPO,
-          targetFile,
-          updatedCode,
-          `[AI Bot 24/7] ${text.substring(0, 50)}`,
-          current.sha
-        );
-
+        const commitRes = await putGitHubFile(GITHUB_REPO, targetFile, aiRes.updatedCode, `[AI Bot] ${text.substring(0, 40)}`, current.sha);
         if (commitRes && commitRes.commit) {
-          await sendTelegram(
-            chatId,
-            `🎉 <b>Готово! Изменения применены на сайте!</b>\n` +
-            `Коммит: <code>${commitRes.commit.sha?.substring(0, 7)}</code>\n` +
-            `Файл: <code>${targetFile}</code>\n` +
-            `Сайт обновится через минуту: <a href="https://oge-vyzhimka.github.io/vijimka-oge/">Открыть сайт</a>`
-          );
+          await sendTelegram(chatId, `🎉 <b>Сайт обновлен!</b> Коммит: <code>${commitRes.commit.sha?.substring(0, 7)}</code>`);
         } else {
-          await sendTelegram(chatId, `❌ Не удалось запушить коммит в GitHub. Проверь права токена.`);
+          await sendTelegram(chatId, `❌ Ошибка пуша коммита.`);
         }
       } catch (err) {
-        console.error("AI task error:", err);
-        await sendTelegram(chatId, `⚠️ Ошибка при выполнении задачи: ${String(err)}`);
+        await sendTelegram(chatId, `⚠️ Ошибка: ${String(err)}`);
       }
     };
 
@@ -716,9 +972,9 @@ Deno.serve(async (req: Request) => {
       processAiTask().catch(console.error);
     }
 
-    return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ ok: true }));
   } catch (err) {
     console.error("Webhook processing error:", err);
-    return new Response(JSON.stringify({ error: String(err) }), { status: 500, headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ error: String(err) }), { status: 500 });
   }
 });
